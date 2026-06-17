@@ -12,10 +12,25 @@ st.set_page_config(
 )
 
 @st.cache_data
-def load_data():
+def load_csvs():
     customers = pd.read_csv('customer_profiles.csv')
     products = pd.read_csv('product_inventory.csv')
     sales = pd.read_csv('sales_transaction.csv')
+    return customers, products, sales
+
+def run_query(sql_query):
+    customers, products, sales = load_csvs()
+    conn = sqlite3.connect(':memory:')
+    customers.to_sql('Customers', conn, if_exists='replace', index=False)
+    products.to_sql('Products', conn, if_exists='replace', index=False)
+    sales.to_sql('Sales', conn, if_exists='replace', index=False)
+    df = pd.read_sql(sql_query, conn)
+    conn.close()
+    return df
+
+@st.cache_data
+def load_data():
+    customers, products, sales = load_csvs()
 
     conn = sqlite3.connect(':memory:')
 
@@ -440,6 +455,67 @@ def show_product_analysis():
     ax3.legend()
     st.pyplot(fig3)
 
+    st.divider()
+    st.header("⚡ Interactive Inventory Planner & Reorder Assistant")
+    st.markdown("Use this tool to simulate restock decisions and calculate their impact on inventory cover ratios in real-time.")
+    
+    try:
+        products_df, _, sales_df = load_csvs()
+        
+        # Calculate average sales per month for products to make it smart
+        sales_cleaned_df = sales_df.drop_duplicates(subset=['CustomerID', 'ProductID', 'QuantityPurchased', 'TransactionDate', 'Price'])
+        merged_sales = sales_cleaned_df.merge(products_df, on='ProductID', suffixes=('', '_prod'))
+        
+        prod_sales_summary = merged_sales.groupby('ProductName').agg(
+            TotalSold=('QuantityPurchased', 'sum')
+        ).reset_index()
+        
+        # Merge back to products list
+        products_list = products_df.merge(prod_sales_summary, on='ProductName', how='left').fillna(0)
+        
+        selected_prod_name = st.selectbox("Select a Product to Analyze:", sorted(products_list['ProductName'].unique()))
+        prod_info = products_list[products_list['ProductName'] == selected_prod_name].iloc[0]
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Current Stock Level", f"{int(prod_info['StockLevel'])} units")
+        with col2:
+            st.metric("Total Sold (Demand)", f"{int(prod_info['TotalSold'])} units")
+        with col3:
+            cover_ratio = prod_info['StockLevel'] / prod_info['TotalSold'] if prod_info['TotalSold'] > 0 else 999.0
+            st.metric("Inventory Cover Ratio", f"{cover_ratio:.2f}")
+            
+        st.markdown("---")
+        st.subheader("Simulate Reorder")
+        reorder_qty = st.number_input("Enter proposed order quantity (units):", min_value=0, value=50, step=10)
+        
+        new_stock = prod_info['StockLevel'] + reorder_qty
+        new_cover_ratio = new_stock / prod_info['TotalSold'] if prod_info['TotalSold'] > 0 else 999.0
+        
+        sales_q1_thresh = data['quantile_results']['Sales_Q1'].iloc[0]
+        stock_q3_thresh = data['quantile_results']['Stock_Q3'].iloc[0]
+        ratio_p90_thresh = data['quantile_results']['Ratio_P90'].iloc[0]
+        
+        if new_cover_ratio > ratio_p90_thresh:
+            status_color = "red"
+            status_label = "⚠️ Overstock Risk (High capital lock-up)"
+            suggestion = f"We recommend ordering fewer units. The cover ratio exceeds the 90th percentile threshold ({ratio_p90_thresh:.2f})."
+        elif new_stock < prod_info['TotalSold'] * 0.1:
+            status_color = "orange"
+            status_label = "⚠️ Stockout Risk (High demand, low supply)"
+            suggestion = "We recommend ordering more units to cover demand and prevent empty shelves."
+        else:
+            status_color = "green"
+            status_label = "✅ Optimized Stock Level"
+            suggestion = "This order quantity is balanced and keeps the cover ratio within a healthy range."
+            
+        st.markdown(f"**Projected Stock Level:** `{int(new_stock)}` units")
+        st.markdown(f"**Projected Inventory Cover Ratio:** `{new_cover_ratio:.2f}`")
+        st.markdown(f"**Status Evaluation:** :{status_color}[{status_label}]")
+        st.info(suggestion)
+    except Exception as e:
+        st.error(f"Error loading product planner data: {e}")
+
 
 def show_sales_trends():
     st.title("📅 Sales Trends Analysis")
@@ -536,9 +612,297 @@ def show_customer_segmentation():
         st.subheader("💡 The Opportunity (e.g., Bronze/One-Time Buyer)")
         st.write("Your largest group. Converting even a small fraction to repeat purchasers will have a huge impact. **Goal: Reach out and encourage a second purchase.**")
 
+    st.divider()
+    st.header("🎯 Customer Strategy & Email Outreach Generator")
+    st.markdown("Search for any Customer ID to view their detailed purchase history and dynamically generate a personalized marketing email.")
+    
+    cust_id = st.number_input("Enter Customer ID (1 - 1000):", min_value=1, max_value=1000, value=103)
+    
+    customer_query = f"""
+    WITH
+    sales_cleaned AS (
+        SELECT * FROM (
+            SELECT *, ROW_NUMBER() OVER(PARTITION BY CustomerID, ProductID, QuantityPurchased, TransactionDate, Price ORDER BY TransactionID) as rn
+            FROM Sales
+        ) WHERE rn = 1
+    ),
+    CustomerSpend AS (
+        SELECT CustomerID, SUM(QuantityPurchased * Price) as TotalSpend, COUNT(TransactionID) as TotalTransactions
+        FROM sales_cleaned
+        GROUP BY CustomerID
+    ),
+    TransactionGaps AS (
+      SELECT
+        CustomerID,
+        JULIANDAY(DATE('20' || SUBSTR(TransactionDate, 7, 2) || '-' || SUBSTR(TransactionDate, 4, 2) || '-' || SUBSTR(TransactionDate, 1, 2))) -
+        JULIANDAY(LAG(DATE('20' || SUBSTR(TransactionDate, 7, 2) || '-' || SUBSTR(TransactionDate, 4, 2) || '-' || SUBSTR(TransactionDate, 1, 2)), 1)
+        OVER (PARTITION BY CustomerID ORDER BY DATE('20' || SUBSTR(TransactionDate, 7, 2) || '-' || SUBSTR(TransactionDate, 4, 2) || '-' || SUBSTR(TransactionDate, 1, 2))))
+        AS DaysSinceLastPurchase
+      FROM sales_cleaned
+    ),
+    CustomerFrequency AS (
+      SELECT
+        CustomerID,
+        AVG(DaysSinceLastPurchase) AS AvgDaysBetweenPurchases
+      FROM TransactionGaps
+      WHERE DaysSinceLastPurchase IS NOT NULL
+      GROUP BY CustomerID
+    )
+    SELECT 
+        c.CustomerID, c.Age, c.Gender, COALESCE(c.Location, 'Unknown') as Location, c.JoinDate,
+        COALESCE(s.TotalSpend, 0) as TotalSpend, COALESCE(s.TotalTransactions, 0) as TotalTransactions,
+        COALESCE(f.AvgDaysBetweenPurchases, 999) as AvgDaysBetweenPurchases
+    FROM Customers c
+    LEFT JOIN CustomerSpend s ON c.CustomerID = s.CustomerID
+    LEFT JOIN CustomerFrequency f ON c.CustomerID = f.CustomerID
+    WHERE c.CustomerID = {cust_id}
+    """
+    
+    try:
+        cust_profile = run_query(customer_query)
+        if not cust_profile.empty:
+            cust_data = cust_profile.iloc[0]
+            
+            segment_query = f"""
+            WITH
+            sales_cleaned AS (
+                SELECT * FROM (
+                    SELECT *, ROW_NUMBER() OVER(PARTITION BY CustomerID, ProductID, QuantityPurchased, TransactionDate, Price ORDER BY TransactionID) as rn
+                    FROM Sales
+                ) WHERE rn = 1
+            ),
+            CustomerSpend AS (
+                SELECT CustomerID, SUM(QuantityPurchased * Price) as TotalSpend
+                FROM sales_cleaned
+                GROUP BY CustomerID
+            ),
+            RankedSpend AS (
+                SELECT TotalSpend, ROW_NUMBER() OVER (ORDER BY TotalSpend) AS SpendRank, COUNT(*) OVER () AS CustomerCount FROM CustomerSpend
+            ),
+            Thresholds AS (
+                SELECT 
+                    (SELECT TotalSpend FROM RankedSpend WHERE SpendRank = CAST(CustomerCount * 0.75 AS INTEGER)) AS P75,
+                    (SELECT TotalSpend FROM RankedSpend WHERE SpendRank = CAST(CustomerCount * 0.90 AS INTEGER)) AS P90,
+                    (SELECT TotalSpend FROM RankedSpend WHERE SpendRank = CAST(CustomerCount * 0.95 AS INTEGER)) AS P95,
+                    (SELECT TotalSpend FROM RankedSpend WHERE SpendRank = CAST(CustomerCount * 0.99 AS INTEGER)) AS P99
+                FROM RankedSpend LIMIT 1
+            ),
+            TransactionGaps AS (
+              SELECT
+                CustomerID,
+                JULIANDAY(DATE('20' || SUBSTR(TransactionDate, 7, 2) || '-' || SUBSTR(TransactionDate, 4, 2) || '-' || SUBSTR(TransactionDate, 1, 2))) -
+                JULIANDAY(LAG(DATE('20' || SUBSTR(TransactionDate, 7, 2) || '-' || SUBSTR(TransactionDate, 4, 2) || '-' || SUBSTR(TransactionDate, 1, 2)), 1)
+                OVER (PARTITION BY CustomerID ORDER BY DATE('20' || SUBSTR(TransactionDate, 7, 2) || '-' || SUBSTR(TransactionDate, 4, 2) || '-' || SUBSTR(TransactionDate, 1, 2))))
+                AS DaysSinceLastPurchase
+              FROM sales_cleaned
+            ),
+            CustomerFrequency AS (
+              SELECT
+                CustomerID,
+                AVG(DaysSinceLastPurchase) AS AvgDaysBetweenPurchases
+              FROM TransactionGaps
+              WHERE DaysSinceLastPurchase IS NOT NULL
+              GROUP BY CustomerID
+            ),
+            RankedBehaviour AS (
+              SELECT
+                CustomerID, AvgDaysBetweenPurchases,
+                ROW_NUMBER() OVER (ORDER BY AvgDaysBetweenPurchases) AS FrequencyRank,
+                COUNT(*) OVER () AS TotalRepeatCustomers
+              FROM CustomerFrequency
+            ),
+            FreqThresholds AS (
+              SELECT
+                (SELECT AvgDaysBetweenPurchases FROM RankedBehaviour WHERE FrequencyRank = CAST(TotalRepeatCustomers * 0.33 AS INTEGER)) AS P33,
+                (SELECT AvgDaysBetweenPurchases FROM RankedBehaviour WHERE FrequencyRank = CAST(TotalRepeatCustomers * 0.66 AS INTEGER)) AS P66
+              FROM RankedBehaviour LIMIT 1
+            )
+            SELECT 
+                c.CustomerID,
+                CASE
+                    WHEN s.TotalSpend > t.P99 THEN 'Diamond'
+                    WHEN s.TotalSpend > t.P95 THEN 'Platinum'
+                    WHEN s.TotalSpend > t.P90 THEN 'Gold'
+                    WHEN s.TotalSpend > t.P75 THEN 'Silver'
+                    WHEN s.TotalSpend IS NOT NULL THEN 'Bronze'
+                    ELSE 'Inactive'
+                END AS ValueSegment,
+                CASE
+                    WHEN f.AvgDaysBetweenPurchases <= ft.P33 THEN 'Frequent'
+                    WHEN f.AvgDaysBetweenPurchases <= ft.P66 THEN 'Regular'
+                    WHEN f.AvgDaysBetweenPurchases > ft.P66 THEN 'Infrequent'
+                    WHEN s.TotalSpend IS NOT NULL THEN 'One-Time Buyer'
+                    ELSE 'Inactive'
+                END AS FrequencySegment
+            FROM Customers c
+            CROSS JOIN Thresholds t
+            CROSS JOIN FreqThresholds ft
+            LEFT JOIN CustomerSpend s ON c.CustomerID = s.CustomerID
+            LEFT JOIN CustomerFrequency f ON c.CustomerID = f.CustomerID
+            WHERE c.CustomerID = {cust_id}
+            """
+            
+            seg_info = run_query(segment_query).iloc[0]
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.markdown(f"### Profile Card (ID: {cust_id})")
+                st.write(f"**Age:** {int(cust_data['Age'])}")
+                st.write(f"**Gender:** {cust_data['Gender']}")
+                st.write(f"**Location:** {cust_data['Location']}")
+                st.write(f"**Join Date:** {cust_data['JoinDate']}")
+            with col2:
+                st.markdown("### Purchase Metrics")
+                st.write(f"**Total Spend:** `${cust_data['TotalSpend']:,.2f}`")
+                st.write(f"**Total Transactions:** {int(cust_data['TotalTransactions'])}")
+                st.write(f"**Avg Days Between Purchases:** {f'{cust_data['AvgDaysBetweenPurchases']:.1f} days' if cust_data['AvgDaysBetweenPurchases'] != 999 else 'N/A (One-time)'}")
+            with col3:
+                st.markdown("### Segment Classification")
+                st.markdown(f"**Value Segment:** `{seg_info['ValueSegment']}`")
+                st.markdown(f"**Frequency Segment:** `{seg_info['FrequencySegment']}`")
+                
+            st.markdown("---")
+            st.subheader("✉️ Automated Marketing Email Generator")
+            
+            email_type = st.selectbox(
+                "Choose Email Outreach Campaign Template:", 
+                ["VIP Appreciation & Gift (Diamond/Platinum)", "Re-engagement Incentive (Infrequent/Gold)", "Second Purchase Welcome Discount (Bronze/One-time)"]
+            )
+            
+            if email_type == "VIP Appreciation & Gift (Diamond/Platinum)":
+                subject = f"Exclusive Rewards: A special thank you for being a valued {seg_info['ValueSegment']} member!"
+                body = f"""Dear Customer {cust_id},
+
+We want to express our deepest gratitude for your continued support as one of our premier {seg_info['ValueSegment']} customers! 
+
+To show our appreciation, we've loaded a special $50 shopping credit to your account. You can use this during your next purchase in our shop.
+
+Thank you for being part of our {cust_data['Location']} region community!
+
+Warm regards,
+Retail Analytics Team
+"""
+            elif email_type == "Re-engagement Incentive (Infrequent/Gold)":
+                subject = "We miss you! Here is 20% off your next order"
+                body = f"""Dear Customer {cust_id},
+
+It's been a little while since your last purchase. As one of our highly valued {seg_info['ValueSegment']} tier members, we miss having you around!
+
+We'd love to welcome you back with a special 20% discount code for your next order: **WELCOMEBACK20**.
+
+Check out our new arrivals today!
+
+Warm regards,
+Retail Analytics Team
+"""
+            else:
+                subject = "Enjoy 15% off your next purchase!"
+                body = f"""Dear Customer {cust_id},
+
+Thank you for your recent order! We hope you enjoyed your items. 
+
+We would love to help you find your next favorite item, so we're giving you a 15% off coupon code for your next purchase: **NEXT15**.
+
+Have a wonderful day!
+
+Warm regards,
+Retail Analytics Team
+"""
+            
+            st.text_input("Email Subject Line:", value=subject)
+            st.text_area("Email Content:", value=body, height=200)
+            st.caption("Copy this text directly to use in your outreach campaign.")
+        else:
+            st.warning("Customer ID not found.")
+    except Exception as e:
+        st.error(f"Error loading customer profile: {e}")
+
 plt.style.use('dark_background')
+def show_sql_sandbox():
+    st.title("🗄️ Interactive Database SQL Sandbox")
+    st.markdown("""
+    Explore the retail dataset directly using SQL. The database contains three tables:
+    - **`Customers`**: `CustomerID` (INT), `Age` (INT), `Gender` (TEXT), `Location` (TEXT), `JoinDate` (TEXT)
+    - **`Products`**: `ProductID` (INT), `ProductName` (TEXT), `Category` (TEXT), `StockLevel` (INT), `Price` (REAL)
+    - **`Sales`**: `TransactionID` (INT), `CustomerID` (INT), `ProductID` (INT), `QuantityPurchased` (INT), `TransactionDate` (TEXT), `Price` (REAL)
+    """)
+    
+    st.subheader("Query Templates")
+    template = st.selectbox(
+        "Choose a template query to start with:",
+        [
+            "Custom Query",
+            "Show first 10 rows of Customers table",
+            "Find Top 10 products by total revenue",
+            "List customers from East location who are older than 50",
+            "Calculate average days between purchases for repeat customers",
+            "Detect duplicate transactions (transaction cleaning step)"
+        ]
+    )
+    
+    default_query = "SELECT * FROM Customers LIMIT 10;"
+    if template == "Show first 10 rows of Customers table":
+        default_query = "SELECT * FROM Customers LIMIT 10;"
+    elif template == "Find Top 10 products by total revenue":
+        default_query = """SELECT p.ProductID, p.ProductName, p.Category, SUM(s.QuantityPurchased * p.Price) AS TotalRevenue
+FROM Sales s
+JOIN Products p ON s.ProductID = p.ProductID
+GROUP BY p.ProductID, p.ProductName, p.Category
+ORDER BY TotalRevenue DESC
+LIMIT 10;"""
+    elif template == "List customers from East location who are older than 50":
+        default_query = "SELECT * FROM Customers WHERE Location = 'East' AND Age > 50;"
+    elif template == "Calculate average days between purchases for repeat customers":
+        default_query = """WITH TransactionGaps AS (
+  SELECT CustomerID,
+         JULIANDAY(DATE('20' || SUBSTR(TransactionDate, 7, 2) || '-' || SUBSTR(TransactionDate, 4, 2) || '-' || SUBSTR(TransactionDate, 1, 2))) -
+         JULIANDAY(LAG(DATE('20' || SUBSTR(TransactionDate, 7, 2) || '-' || SUBSTR(TransactionDate, 4, 2) || '-' || SUBSTR(TransactionDate, 1, 2)), 1)
+         OVER (PARTITION BY CustomerID ORDER BY DATE('20' || SUBSTR(TransactionDate, 7, 2) || '-' || SUBSTR(TransactionDate, 4, 2) || '-' || SUBSTR(TransactionDate, 1, 2)))) AS DaysGap
+  FROM Sales
+)
+SELECT CustomerID, AVG(DaysGap) AS AvgDaysBetweenPurchases
+FROM TransactionGaps
+WHERE DaysGap IS NOT NULL
+GROUP BY CustomerID
+LIMIT 10;"""
+    elif template == "Detect duplicate transactions (transaction cleaning step)":
+        default_query = """SELECT CustomerID, ProductID, QuantityPurchased, TransactionDate, Price, COUNT(*) as DuplicateCount
+FROM Sales
+GROUP BY CustomerID, ProductID, QuantityPurchased, TransactionDate, Price
+HAVING DuplicateCount > 1
+LIMIT 10;"""
+        
+    query_input = st.text_area("Write your SQL Query here:", value=default_query, height=180)
+    
+    if st.button("Run SQL Query ⚡"):
+        try:
+            with st.spinner("Executing query..."):
+                query_result = run_query(query_input)
+                st.success(f"Query executed successfully! (Returned {len(query_result)} rows)")
+                st.dataframe(query_result)
+                
+                # Download button
+                csv = query_result.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="Download Results as CSV 📥",
+                    data=csv,
+                    file_name="query_results.csv",
+                    mime="text/csv",
+                )
+        except Exception as e:
+            st.error(f"SQL Error: {e}")
+
 st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["Executive Summary", "Product & Inventory Analysis", "Sales Trends", "Customer Segmentation"])
+page = st.sidebar.radio(
+    "Go to", 
+    [
+        "Executive Summary", 
+        "Product & Inventory Analysis", 
+        "Sales Trends", 
+        "Customer Segmentation",
+        "Database SQL Sandbox 🗄️"
+    ]
+)
 
 if page == "Executive Summary":
     show_executive_summary()
@@ -548,3 +912,5 @@ elif page == "Sales Trends":
     show_sales_trends()
 elif page == "Customer Segmentation":
     show_customer_segmentation()
+elif page == "Database SQL Sandbox 🗄️":
+    show_sql_sandbox()
